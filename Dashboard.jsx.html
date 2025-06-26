@@ -1,0 +1,397 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { ethers } from 'ethers';
+import { Line } from 'react-chartjs-2';
+import {
+  Chart as ChartJS,
+  CategoryScale,
+  LinearScale,
+  PointElement,
+  LineElement,
+  Title,
+  Tooltip,
+  Legend,
+  Filler
+} from 'chart.js';
+
+// Register ChartJS components
+ChartJS.register(
+  CategoryScale,
+  LinearScale,
+  PointElement,
+  LineElement,
+  Title,
+  Tooltip,
+  Legend,
+  Filler
+);
+
+// Environment variables for production security
+const RPC_URL = process.env.REACT_APP_RPC_URL || 'https://mainnet.base.org';
+const CONTRACT_ADDRESS = process.env.REACT_APP_CONTRACT_ADDRESS || '0x7102a550B0EcbBCbD289630Cd560189B44674192';
+const CONTRACT_ABI = [
+  {
+    "anonymous": false,
+    "inputs": [
+      {"indexed": true, "name": "user", "type": "address"},
+      {"indexed": false, "name": "ticketId", "type": "string"},
+      {"indexed": false, "name": "amount", "type": "uint256"}
+    ],
+    "name": "TicketPurchased",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {"indexed": false, "name": "drawId", "type": "uint256"},
+      {"indexed": true, "name": "winner", "type": "address"}
+    ],
+    "name": "DrawCompleted",
+    "type": "event"
+  },
+  {
+    "inputs": [],
+    "name": "recentWinner",
+    "outputs": [{"name": "", "type": "address"}],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "currentJackpot",
+    "outputs": [{"name": "", "type": "uint256"}],
+    "stateMutability": "view",
+    "type": "function"
+  }
+];
+
+const Dashboard = () => {
+  const [activities, setActivities] = useState([]);
+  const [isAuthenticated, setIsAuthenticated] = useState(
+    localStorage.getItem('isAuthenticated') === 'true' && 
+    sessionStorage.getItem('sessionActive') === 'true'
+  );
+  const [password, setPassword] = useState('');
+  const [metrics, setMetrics] = useState({
+    jackpot: '0 ETH',
+    totalTickets: 0,
+    lastWinner: '0x000...000'
+  });
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState('');
+  const navigate = useNavigate();
+
+  // Secure login with session management
+  const handleLogin = useCallback(async (e) => {
+    e.preventDefault();
+    setIsLoading(true);
+    
+    try {
+      // In production, replace with your auth API call
+      const response = await mockAuthAPI(password);
+      
+      if (response.authenticated) {
+        localStorage.setItem('isAuthenticated', 'true');
+        sessionStorage.setItem('sessionActive', 'true');
+        setIsAuthenticated(true);
+      } else {
+        setError('Invalid credentials');
+      }
+    } catch (err) {
+      setError('Authentication failed');
+      console.error(err);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [password]);
+
+  // Mock auth function - replace with real auth in production
+  const mockAuthAPI = async (pass) => {
+    return new Promise(resolve => {
+      setTimeout(() => {
+        resolve({ authenticated: pass === process.env.REACT_APP_ADMIN_PASSWORD });
+      }, 800);
+    });
+  };
+
+  // Fetch blockchain data
+  const fetchBlockchainData = useCallback(async () => {
+    if (!isAuthenticated) return;
+
+    try {
+      const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
+      const contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, provider);
+
+      const [ticketEvents, drawEvents, recentWinner, currentJackpot] = await Promise.all([
+        contract.queryFilter('TicketPurchased', -5000),
+        contract.queryFilter('DrawCompleted', -5000),
+        contract.recentWinner(),
+        contract.currentJackpot()
+      ]);
+
+      // Process activities
+      const processedActivities = [
+        ...ticketEvents.map(event => ({
+          timestamp: new Date((event.args.amount._hex) * 1000),
+          type: 'ticket_purchase',
+          details: {
+            ticketId: event.args.ticketId,
+            amount: ethers.utils.formatEther(event.args.amount),
+            user: `${event.args.user.substring(0, 6)}...${event.args.user.substring(38)}`
+          }
+        })),
+        ...drawEvents.map(event => ({
+          timestamp: new Date(),
+          type: 'draw',
+          details: {
+            drawId: event.args.drawId.toString(),
+            winner: `${event.args.winner.substring(0, 6)}...${event.args.winner.substring(38)}`
+          }
+        }))
+      ].sort((a, b) => b.timestamp - a.timestamp);
+
+      setActivities(processedActivities.slice(0, 100));
+      setMetrics({
+        jackpot: `${ethers.utils.formatEther(currentJackpot)} ETH`,
+        totalTickets: ticketEvents.length,
+        lastWinner: recentWinner || 'No winner yet'
+      });
+    } catch (err) {
+      console.error('Blockchain error:', err);
+      setError('Failed to load blockchain data');
+    }
+  }, [isAuthenticated]);
+
+  // Logout with cleanup
+  const handleLogout = useCallback(() => {
+    localStorage.removeItem('isAuthenticated');
+    sessionStorage.removeItem('sessionActive');
+    setIsAuthenticated(false);
+    navigate('/');
+  }, [navigate]);
+
+  // Data polling effect
+  useEffect(() => {
+    if (!isAuthenticated) return;
+
+    fetchBlockchainData();
+    const interval = setInterval(fetchBlockchainData, 15000);
+
+    return () => clearInterval(interval);
+  }, [isAuthenticated, fetchBlockchainData]);
+
+  // Auto-logout after 30 minutes
+  useEffect(() => {
+    if (!isAuthenticated) return;
+
+    const timeout = setTimeout(() => {
+      handleLogout();
+    }, 30 * 60 * 1000);
+
+    return () => clearTimeout(timeout);
+  }, [isAuthenticated, handleLogout]);
+
+  // Chart data configuration
+  const chartData = {
+    labels: activities.slice(0, 30).map(a => 
+      new Date(a.timestamp).toLocaleTimeString()
+    ),
+    datasets: [
+      {
+        label: 'Ticket Purchases (ETH)',
+        data: activities.slice(0, 30).map(a => 
+          a.type === 'ticket_purchase' ? parseFloat(a.details.amount) : 0
+        ),
+        borderColor: 'rgb(106, 27, 154)',
+        backgroundColor: 'rgba(106, 27, 154, 0.1)',
+        tension: 0.3,
+        fill: true
+      }
+    ]
+  };
+
+  if (!isAuthenticated) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gray-50">
+        <div className="w-full max-w-md p-8 space-y-8 bg-white rounded-xl shadow-lg">
+          <div className="text-center">
+            <h2 className="text-3xl font-extrabold text-gray-900">
+              Admin Portal
+            </h2>
+            <p className="mt-2 text-sm text-gray-600">
+              LuckyLoop Lottery Dashboard
+            </p>
+          </div>
+          <form className="mt-8 space-y-6" onSubmit={handleLogin}>
+            {error && (
+              <div className="px-4 py-3 text-sm text-red-700 bg-red-100 rounded-md">
+                {error}
+              </div>
+            )}
+            <div className="rounded-md shadow-sm space-y-4">
+              <div>
+                <label htmlFor="password" className="sr-only">
+                  Password
+                </label>
+                <input
+                  id="password"
+                  name="password"
+                  type="password"
+                  required
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  className="appearance-none relative block w-full px-3 py-3 border border-gray-300 placeholder-gray-500 text-gray-900 rounded-md focus:outline-none focus:ring-purple-500 focus:border-purple-500 focus:z-10 sm:text-sm"
+                  placeholder="Enter admin password"
+                />
+              </div>
+            </div>
+            <div>
+              <button
+                type="submit"
+                disabled={isLoading}
+                className={`group relative w-full flex justify-center py-3 px-4 border border-transparent text-sm font-medium rounded-md text-white bg-purple-600 hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-purple-500 ${isLoading ? 'opacity-75 cursor-not-allowed' : ''}`}
+              >
+                {isLoading ? 'Authenticating...' : 'Sign in'}
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50 p-4 md:p-8">
+      <div className="max-w-7xl mx-auto">
+        {/* Header */}
+        <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-8">
+          <div>
+            <h1 className="text-2xl md:text-3xl font-bold text-gray-900">
+              LuckyLoop Lottery Dashboard
+            </h1>
+            <p className="text-sm text-gray-500">
+              Real-time monitoring and analytics
+            </p>
+          </div>
+          <button
+            onClick={handleLogout}
+            className="mt-4 md:mt-0 px-4 py-2 bg-red-600 text-white text-sm font-medium rounded-md hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500"
+          >
+            Logout
+          </button>
+        </div>
+
+        {/* Metrics Cards */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+          <div className="bg-white p-6 rounded-lg shadow">
+            <h3 className="text-lg font-medium text-gray-900">Current Jackpot</h3>
+            <p className="mt-2 text-3xl font-semibold text-purple-600">
+              {metrics.jackpot}
+            </p>
+          </div>
+          <div className="bg-white p-6 rounded-lg shadow">
+            <h3 className="text-lg font-medium text-gray-900">Total Tickets</h3>
+            <p className="mt-2 text-3xl font-semibold text-purple-600">
+              {metrics.totalTickets.toLocaleString()}
+            </p>
+          </div>
+          <div className="bg-white p-6 rounded-lg shadow">
+            <h3 className="text-lg font-medium text-gray-900">Last Winner</h3>
+            <p className="mt-2 text-lg font-medium text-purple-600 break-all">
+              {metrics.lastWinner}
+            </p>
+          </div>
+        </div>
+
+        {/* Charts Section */}
+        <div className="bg-white p-6 rounded-lg shadow mb-8">
+          <h2 className="text-xl font-semibold text-gray-900 mb-4">
+            Ticket Sales (Last 30 Transactions)
+          </h2>
+          <div className="h-80">
+            <Line 
+              data={chartData}
+              options={{
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                  legend: {
+                    position: 'top',
+                  },
+                  tooltip: {
+                    callbacks: {
+                      label: (context) => {
+                        const activity = activities[context.dataIndex];
+                        return [
+                          `Amount: ${context.raw} ETH`,
+                          `User: ${activity.details.user}`
+                        ];
+                      }
+                    }
+                  }
+                },
+                scales: {
+                  y: {
+                    beginAtZero: true,
+                    ticks: {
+                      callback: (value) => `${value} ETH`
+                    }
+                  }
+                }
+              }}
+            />
+          </div>
+        </div>
+
+        {/* Activity Feed */}
+        <div className="bg-white p-6 rounded-lg shadow">
+          <h2 className="text-xl font-semibold text-gray-900 mb-4">
+            Recent Activity
+          </h2>
+          <div className="overflow-x-auto">
+            <table className="min-w-full divide-y divide-gray-200">
+              <thead className="bg-gray-50">
+                <tr>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Time
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Type
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Details
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="bg-white divide-y divide-gray-200">
+                {activities.slice(0, 15).map((activity, index) => (
+                  <tr key={index}>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                      {new Date(activity.timestamp).toLocaleString()}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
+                      {activity.type.replace('_', ' ')}
+                    </td>
+                    <td className="px-6 py-4 text-sm text-gray-500">
+                      {activity.type === 'ticket_purchase' ? (
+                        <>
+                          <span className="font-medium">{activity.details.user}</span> bought ticket {activity.details.ticketId} for {activity.details.amount} ETH
+                        </>
+                      ) : (
+                        <>
+                          Draw #{activity.details.drawId} won by <span className="font-medium">{activity.details.winner}</span>
+                        </>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default Dashboard;
